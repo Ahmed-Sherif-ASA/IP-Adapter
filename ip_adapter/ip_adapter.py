@@ -46,6 +46,43 @@ class ImageProjModel(torch.nn.Module):
         return clip_extra_context_tokens
 
 
+class EmbeddingAdapter(torch.nn.Module):
+    """Adapter for different embedding types"""
+    
+    def __init__(self, cross_attention_dim=1024, embedding_dim=1024, num_tokens=4):
+        super().__init__()
+        self.cross_attention_dim = cross_attention_dim
+        self.embedding_dim = embedding_dim
+        self.num_tokens = num_tokens
+        
+        # Projection layers for different embedding types
+        self.proj_layers = torch.nn.ModuleDict({
+            'clip': ImageProjModel(
+                cross_attention_dim=cross_attention_dim,
+                clip_embeddings_dim=embedding_dim,
+                clip_extra_context_tokens=num_tokens
+            ),
+            'dino': MLPProjModel(
+                cross_attention_dim=cross_attention_dim,
+                clip_embeddings_dim=embedding_dim
+            ),
+            'custom': torch.nn.Sequential(
+                torch.nn.Linear(embedding_dim, cross_attention_dim * num_tokens),
+                torch.nn.LayerNorm(cross_attention_dim * num_tokens)
+            )
+        })
+        
+    def forward(self, embeddings, embedding_type='clip'):
+        if embedding_type not in self.proj_layers:
+            raise ValueError(f"Unsupported embedding type: {embedding_type}. Supported types: {list(self.proj_layers.keys())}")
+        
+        proj_layer = self.proj_layers[embedding_type]
+        if embedding_type == 'custom':
+            # Reshape for custom embeddings
+            return proj_layer(embeddings).reshape(-1, self.num_tokens, self.cross_attention_dim)
+        return proj_layer(embeddings)
+
+
 class MLPProjModel(torch.nn.Module):
     """SD model with image prompt"""
     def __init__(self, cross_attention_dim=1024, clip_embeddings_dim=1024):
@@ -64,31 +101,41 @@ class MLPProjModel(torch.nn.Module):
 
 
 class IPAdapter:
-    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4):
+    def __init__(self, sd_pipe, image_encoder_path, ip_ckpt, device, num_tokens=4, embedding_type='clip'):
         self.device = device
         self.image_encoder_path = image_encoder_path
         self.ip_ckpt = ip_ckpt
         self.num_tokens = num_tokens
+        self.embedding_type = embedding_type
 
         self.pipe = sd_pipe.to(self.device)
         self.set_ip_adapter()
 
-        # load image encoder
-        self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
-            self.device, dtype=torch.float16
-        )
-        self.clip_image_processor = CLIPImageProcessor()
+        # load image encoder if using CLIP
+        if embedding_type == 'clip':
+            self.image_encoder = CLIPVisionModelWithProjection.from_pretrained(self.image_encoder_path).to(
+                self.device, dtype=torch.float16
+            )
+            self.clip_image_processor = CLIPImageProcessor()
+        
         # image proj model
         self.image_proj_model = self.init_proj()
-
         self.load_ip_adapter()
 
     def init_proj(self):
-        image_proj_model = ImageProjModel(
-            cross_attention_dim=self.pipe.unet.config.cross_attention_dim,
-            clip_embeddings_dim=self.image_encoder.config.projection_dim,
-            clip_extra_context_tokens=self.num_tokens,
-        ).to(self.device, dtype=torch.float16)
+        if self.embedding_type == 'clip':
+            image_proj_model = ImageProjModel(
+                cross_attention_dim=self.pipe.unet.config.cross_attention_dim,
+                clip_embeddings_dim=self.image_encoder.config.projection_dim,
+                clip_extra_context_tokens=self.num_tokens,
+            ).to(self.device, dtype=torch.float16)
+        else:
+            # For other embedding types, use the EmbeddingAdapter
+            image_proj_model = EmbeddingAdapter(
+                cross_attention_dim=self.pipe.unet.config.cross_attention_dim,
+                embedding_dim=1024,  # Default dimension, can be overridden
+                num_tokens=self.num_tokens
+            ).to(self.device, dtype=torch.float16)
         return image_proj_model
 
     def set_ip_adapter(self):
@@ -137,16 +184,26 @@ class IPAdapter:
         ip_layers.load_state_dict(state_dict["ip_adapter"])
 
     @torch.inference_mode()
-    def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
-        if pil_image is not None:
+    def get_image_embeds(self, pil_image=None, clip_image_embeds=None, embedding_type=None):
+        if pil_image is not None and self.embedding_type == 'clip':
             if isinstance(pil_image, Image.Image):
                 pil_image = [pil_image]
             clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
             clip_image_embeds = self.image_encoder(clip_image.to(self.device, dtype=torch.float16)).image_embeds
-        else:
+        elif clip_image_embeds is not None:
             clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
-        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
-        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
+        else:
+            raise ValueError("Either pil_image (for CLIP) or clip_image_embeds must be provided")
+            
+        if self.embedding_type == 'clip': # Indicates self.image_proj_model is ImageProjModel
+            image_prompt_embeds = self.image_proj_model(clip_image_embeds)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
+        else: # Indicates self.image_proj_model is EmbeddingAdapter
+            # Use the embedding_type passed to this function, or default to the adapter's main type
+            type_for_adapter_call = embedding_type or self.embedding_type
+            image_prompt_embeds = self.image_proj_model(clip_image_embeds, embedding_type=type_for_adapter_call)
+            uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds), embedding_type=type_for_adapter_call)
+            
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     def set_scale(self, scale):
@@ -167,12 +224,29 @@ class IPAdapter:
         num_inference_steps=30,
         **kwargs,
     ):
+        """
+        Generate images using either a PIL image or direct CLIP image embeddings.
+        
+        Args:
+            pil_image: Optional PIL image or list of PIL images
+            clip_image_embeds: Optional pre-computed CLIP image embeddings
+            prompt: Text prompt for generation
+            negative_prompt: Negative text prompt
+            scale: IP-Adapter scale
+            num_samples: Number of samples to generate
+            seed: Random seed
+            guidance_scale: Guidance scale for classifier-free guidance
+            num_inference_steps: Number of denoising steps
+            **kwargs: Additional arguments for the pipeline
+        """
         self.set_scale(scale)
 
         if pil_image is not None:
             num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
-        else:
+        elif clip_image_embeds is not None:
             num_prompts = clip_image_embeds.size(0)
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
 
         if prompt is None:
             prompt = "best quality, high quality"
@@ -216,6 +290,44 @@ class IPAdapter:
         ).images
 
         return images
+
+    def generate_from_embeddings(
+        self,
+        clip_image_embeds,
+        prompt=None,
+        negative_prompt=None,
+        scale=1.0,
+        num_samples=4,
+        seed=None,
+        guidance_scale=7.5,
+        num_inference_steps=30,
+        **kwargs,
+    ):
+        """
+        Generate images using pre-computed CLIP image embeddings.
+        
+        Args:
+            clip_image_embeds: Pre-computed CLIP image embeddings
+            prompt: Text prompt for generation
+            negative_prompt: Negative text prompt
+            scale: IP-Adapter scale
+            num_samples: Number of samples to generate
+            seed: Random seed
+            guidance_scale: Guidance scale for classifier-free guidance
+            num_inference_steps: Number of denoising steps
+            **kwargs: Additional arguments for the pipeline
+        """
+        return self.generate(
+            clip_image_embeds=clip_image_embeds,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            scale=scale,
+            num_samples=num_samples,
+            seed=seed,
+            guidance_scale=guidance_scale,
+            num_inference_steps=num_inference_steps,
+            **kwargs,
+        )
 
 
 class IPAdapterXL(IPAdapter):
