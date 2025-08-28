@@ -335,7 +335,8 @@ class IPAdapterXL(IPAdapter):
 
     def generate(
         self,
-        pil_image,
+        pil_image=None,
+        clip_image_embeds=None,
         prompt=None,
         negative_prompt=None,
         scale=1.0,
@@ -346,7 +347,13 @@ class IPAdapterXL(IPAdapter):
     ):
         self.set_scale(scale)
 
-        num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
+        # Handle both PIL images and pre-computed CLIP embeddings
+        if pil_image is not None:
+            num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
+        elif clip_image_embeds is not None:
+            num_prompts = 1 if clip_image_embeds.dim() == 2 else clip_image_embeds.size(0)
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
 
         if prompt is None:
             prompt = "best quality, high quality"
@@ -358,7 +365,7 @@ class IPAdapterXL(IPAdapter):
         if not isinstance(negative_prompt, List):
             negative_prompt = [negative_prompt] * num_prompts
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image)
+        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, clip_image_embeds)
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
