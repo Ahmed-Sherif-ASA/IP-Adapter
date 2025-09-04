@@ -335,7 +335,8 @@ class IPAdapterXL(IPAdapter):
 
     def generate(
         self,
-        pil_image,
+        pil_image=None,
+        clip_image_embeds=None,
         prompt=None,
         negative_prompt=None,
         scale=1.0,
@@ -358,7 +359,7 @@ class IPAdapterXL(IPAdapter):
         if not isinstance(negative_prompt, List):
             negative_prompt = [negative_prompt] * num_prompts
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image)
+        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, clip_image_embeds=clip_image_embeds)
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
@@ -413,16 +414,19 @@ class IPAdapterPlus(IPAdapter):
 
     @torch.inference_mode()
     def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
-        if isinstance(pil_image, Image.Image):
-            pil_image = [pil_image]
-        clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-        clip_image = clip_image.to(self.device, dtype=torch.float16)
-        clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+        if pil_image is not None:
+            if isinstance(pil_image, Image.Image):
+                pil_image = [pil_image]
+            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
+            clip_image = clip_image.to(self.device, dtype=torch.float16)
+            clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+        elif clip_image_embeds is not None:
+            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
+            
         image_prompt_embeds = self.image_proj_model(clip_image_embeds)
-        uncond_clip_image_embeds = self.image_encoder(
-            torch.zeros_like(clip_image), output_hidden_states=True
-        ).hidden_states[-2]
-        uncond_image_prompt_embeds = self.image_proj_model(uncond_clip_image_embeds)
+        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
         return image_prompt_embeds, uncond_image_prompt_embeds
 
 
@@ -435,6 +439,23 @@ class IPAdapterFull(IPAdapterPlus):
             clip_embeddings_dim=self.image_encoder.config.hidden_size,
         ).to(self.device, dtype=torch.float16)
         return image_proj_model
+
+    @torch.inference_mode()
+    def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
+        if pil_image is not None:
+            if isinstance(pil_image, Image.Image):
+                pil_image = [pil_image]
+            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
+            clip_image = clip_image.to(self.device, dtype=torch.float16)
+            clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+        elif clip_image_embeds is not None:
+            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
+            
+        image_prompt_embeds = self.image_proj_model(clip_image_embeds)
+        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
+        return image_prompt_embeds, uncond_image_prompt_embeds
 
 
 class IPAdapterPlusXL(IPAdapter):
@@ -454,22 +475,26 @@ class IPAdapterPlusXL(IPAdapter):
         return image_proj_model
 
     @torch.inference_mode()
-    def get_image_embeds(self, pil_image):
-        if isinstance(pil_image, Image.Image):
-            pil_image = [pil_image]
-        clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
-        clip_image = clip_image.to(self.device, dtype=torch.float16)
-        clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+    def get_image_embeds(self, pil_image=None, clip_image_embeds=None):
+        if pil_image is not None:
+            if isinstance(pil_image, Image.Image):
+                pil_image = [pil_image]
+            clip_image = self.clip_image_processor(images=pil_image, return_tensors="pt").pixel_values
+            clip_image = clip_image.to(self.device, dtype=torch.float16)
+            clip_image_embeds = self.image_encoder(clip_image, output_hidden_states=True).hidden_states[-2]
+        elif clip_image_embeds is not None:
+            clip_image_embeds = clip_image_embeds.to(self.device, dtype=torch.float16)
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
+            
         image_prompt_embeds = self.image_proj_model(clip_image_embeds)
-        uncond_clip_image_embeds = self.image_encoder(
-            torch.zeros_like(clip_image), output_hidden_states=True
-        ).hidden_states[-2]
-        uncond_image_prompt_embeds = self.image_proj_model(uncond_clip_image_embeds)
+        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(clip_image_embeds))
         return image_prompt_embeds, uncond_image_prompt_embeds
 
     def generate(
         self,
-        pil_image,
+        pil_image=None,
+        clip_image_embeds=None,
         prompt=None,
         negative_prompt=None,
         scale=1.0,
@@ -480,7 +505,13 @@ class IPAdapterPlusXL(IPAdapter):
     ):
         self.set_scale(scale)
 
-        num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
+        # Handle both PIL images and pre-computed CLIP embeddings
+        if pil_image is not None:
+            num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
+        elif clip_image_embeds is not None:
+            num_prompts = 1 if clip_image_embeds.dim() == 2 else clip_image_embeds.size(0)
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
 
         if prompt is None:
             prompt = "best quality, high quality"
@@ -492,7 +523,7 @@ class IPAdapterPlusXL(IPAdapter):
         if not isinstance(negative_prompt, List):
             negative_prompt = [negative_prompt] * num_prompts
 
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image)
+        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, clip_image_embeds)
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
