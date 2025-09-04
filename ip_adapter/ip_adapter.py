@@ -347,7 +347,13 @@ class IPAdapterXL(IPAdapter):
     ):
         self.set_scale(scale)
 
-        num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
+        # Handle both pil_image and clip_image_embeds cases
+        if pil_image is not None:
+            num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
+        elif clip_image_embeds is not None:
+            num_prompts = 1 if clip_image_embeds.dim() == 2 else clip_image_embeds.shape[0]
+        else:
+            raise ValueError("Either pil_image or clip_image_embeds must be provided")
 
         if prompt is None:
             prompt = "best quality, high quality"
