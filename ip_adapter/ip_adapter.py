@@ -1,5 +1,4 @@
 import os
-from typing import List
 
 import torch
 from diffusers import StableDiffusionPipeline
@@ -211,13 +210,84 @@ class IPAdapter:
             if isinstance(attn_processor, IPAttnProcessor):
                 attn_processor.scale = scale
 
+    def _mix_text_ip_tokens(
+        self,
+        prompt_embeds_text,          # (B, T_text, C)
+        negative_prompt_embeds_text, # (B, T_text, C)
+        image_prompt_embeds,         # (B, T_ip,   C)
+        uncond_image_prompt_embeds,  # (B, T_ip,   C)
+        *,
+        text_token_scale=1.0,
+        ip_token_scale=1.0,
+        ip_uncond_scale=None,        # default: same as ip_token_scale
+        zero_ip_in_uncond=False,     # True => "pure" unconditional (recommended if you want clean separation)
+        pooled_prompt_embeds=None,   # (B, C) - for SDXL
+        negative_pooled_prompt_embeds=None,  # (B, C) - for SDXL
+    ):
+        """
+        Mix text and IP tokens with separate scaling controls.
+        
+        Args:
+            prompt_embeds_text: Text embeddings for positive prompt
+            negative_prompt_embeds_text: Text embeddings for negative prompt
+            image_prompt_embeds: IP image embeddings for positive prompt
+            uncond_image_prompt_embeds: IP image embeddings for negative prompt
+            text_token_scale: Scale factor for text tokens (both positive and negative)
+            ip_token_scale: Scale factor for IP tokens in positive prompt
+            ip_uncond_scale: Scale factor for IP tokens in negative prompt (defaults to ip_token_scale)
+            zero_ip_in_uncond: If True, zero out IP tokens in negative prompt for clean separation
+            
+        Returns:
+            Tuple of (prompt_embeds, negative_prompt_embeds) ready for pipeline
+        """
+        dtype = prompt_embeds_text.dtype
+        text_s = torch.as_tensor(text_token_scale, device=prompt_embeds_text.device, dtype=dtype)
+        ip_s   = torch.as_tensor(ip_token_scale,   device=prompt_embeds_text.device, dtype=dtype)
+
+        # scale text tokens in both branches (keeps CFG well-behaved)
+        prompt_embeds_text  = prompt_embeds_text  * text_s
+        negative_prompt_embeds_text = negative_prompt_embeds_text * text_s
+        
+        # scale pooled text embeddings for SDXL (if provided)
+        if pooled_prompt_embeds is not None:
+            pooled_prompt_embeds = pooled_prompt_embeds * text_s
+        if negative_pooled_prompt_embeds is not None:
+            negative_pooled_prompt_embeds = negative_pooled_prompt_embeds * text_s
+
+        # scale IP tokens; you can optionally zero them in the unconditional branch
+        if zero_ip_in_uncond:
+            uncond_image_prompt_embeds = torch.zeros_like(uncond_image_prompt_embeds)
+            ip_uncond_s = torch.as_tensor(0.0, device=prompt_embeds_text.device, dtype=dtype)
+        else:
+            if ip_uncond_scale is None:
+                ip_uncond_s = ip_s
+            else:
+                ip_uncond_s = torch.as_tensor(ip_uncond_scale, device=prompt_embeds_text.device, dtype=dtype)
+
+        image_prompt_embeds        = image_prompt_embeds        * ip_s
+        uncond_image_prompt_embeds = uncond_image_prompt_embeds * ip_uncond_s
+
+        # finally concatenate: [text || ip]
+        prompt_embeds  = torch.cat([prompt_embeds_text,          image_prompt_embeds],        dim=1)
+        negative_embeds = torch.cat([negative_prompt_embeds_text, uncond_image_prompt_embeds], dim=1)
+        
+        # Return pooled embeddings if provided (for SDXL)
+        if pooled_prompt_embeds is not None:
+            return prompt_embeds, negative_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
+        else:
+            return prompt_embeds, negative_embeds
+
     def generate(
         self,
         pil_image=None,
         clip_image_embeds=None,
         prompt=None,
         negative_prompt=None,
-        scale=1.0,
+        attn_ip_scale=1.0,
+        text_token_scale=1.0,
+        ip_token_scale=None,
+        ip_uncond_scale=None,
+        zero_ip_in_uncond=False,
         num_samples=4,
         seed=None,
         guidance_scale=7.5,
@@ -232,15 +302,17 @@ class IPAdapter:
             clip_image_embeds: Optional pre-computed CLIP image embeddings
             prompt: Text prompt for generation
             negative_prompt: Negative text prompt
-            scale: IP-Adapter scale
+            attn_ip_scale: Per-layer IP attention gate scale (0.0-2.0)
+            text_token_scale: Text token magnitude scaling (0.0-2.0)
+            ip_token_scale: IP token magnitude scaling (0.0-2.0)
+            ip_uncond_scale: IP token scaling in negative prompt (defaults to ip_token_scale)
+            zero_ip_in_uncond: Zero out IP tokens in negative prompt for clean separation
             num_samples: Number of samples to generate
             seed: Random seed
             guidance_scale: Guidance scale for classifier-free guidance
             num_inference_steps: Number of denoising steps
             **kwargs: Additional arguments for the pipeline
         """
-        self.set_scale(scale)
-
         if pil_image is not None:
             num_prompts = 1 if isinstance(pil_image, Image.Image) else len(pil_image)
         elif clip_image_embeds is not None:
@@ -253,9 +325,9 @@ class IPAdapter:
         if negative_prompt is None:
             negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
-        if not isinstance(prompt, List):
+        if not isinstance(prompt, (list, tuple)):
             prompt = [prompt] * num_prompts
-        if not isinstance(negative_prompt, List):
+        if not isinstance(negative_prompt, (list, tuple)):
             negative_prompt = [negative_prompt] * num_prompts
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(
@@ -267,16 +339,33 @@ class IPAdapter:
         uncond_image_prompt_embeds = uncond_image_prompt_embeds.repeat(1, num_samples, 1)
         uncond_image_prompt_embeds = uncond_image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
 
+        # Set the per-layer IP attention gate
+        self.set_scale(attn_ip_scale)
+        
+        # Handle token scale parameters
+        if ip_token_scale is None:
+            ip_token_scale = attn_ip_scale  # Backward-compatible default
+
         with torch.inference_mode():
-            prompt_embeds_, negative_prompt_embeds_ = self.pipe.encode_prompt(
+            prompt_embeds_text, negative_prompt_embeds_text = self.pipe.encode_prompt(
                 prompt,
                 device=self.device,
                 num_images_per_prompt=num_samples,
                 do_classifier_free_guidance=True,
                 negative_prompt=negative_prompt,
             )
-            prompt_embeds = torch.cat([prompt_embeds_, image_prompt_embeds], dim=1)
-            negative_prompt_embeds = torch.cat([negative_prompt_embeds_, uncond_image_prompt_embeds], dim=1)
+            
+            # Use the new mixing helper with separate scales
+            prompt_embeds, negative_prompt_embeds = self._mix_text_ip_tokens(
+                prompt_embeds_text=prompt_embeds_text,
+                negative_prompt_embeds_text=negative_prompt_embeds_text,
+                image_prompt_embeds=image_prompt_embeds,
+                uncond_image_prompt_embeds=uncond_image_prompt_embeds,
+                text_token_scale=text_token_scale,
+                ip_token_scale=ip_token_scale,
+                ip_uncond_scale=ip_uncond_scale,
+                zero_ip_in_uncond=zero_ip_in_uncond,
+            )
 
         generator = get_generator(seed, self.device)
 
@@ -296,7 +385,11 @@ class IPAdapter:
         clip_image_embeds,
         prompt=None,
         negative_prompt=None,
-        scale=1.0,
+        attn_ip_scale=1.0,
+        text_token_scale=1.0,
+        ip_token_scale=None,
+        ip_uncond_scale=None,
+        zero_ip_in_uncond=False,
         num_samples=4,
         seed=None,
         guidance_scale=7.5,
@@ -321,7 +414,11 @@ class IPAdapter:
             clip_image_embeds=clip_image_embeds,
             prompt=prompt,
             negative_prompt=negative_prompt,
-            scale=scale,
+            attn_ip_scale=attn_ip_scale,
+            text_token_scale=text_token_scale,
+            ip_token_scale=ip_token_scale,
+            ip_uncond_scale=ip_uncond_scale,
+            zero_ip_in_uncond=zero_ip_in_uncond,
             num_samples=num_samples,
             seed=seed,
             guidance_scale=guidance_scale,
@@ -339,13 +436,23 @@ class IPAdapterXL(IPAdapter):
         clip_image_embeds=None,
         prompt=None,
         negative_prompt=None,
-        scale=1.0,
+        attn_ip_scale=1.0,
+        text_token_scale=1.0,
+        ip_token_scale=None,
+        ip_uncond_scale=None,
+        zero_ip_in_uncond=False,
         num_samples=4,
         seed=None,
+        guidance_scale=7.5,
         num_inference_steps=30,
         **kwargs,
     ):
-        self.set_scale(scale)
+        # Set the per-layer IP attention gate
+        self.set_scale(attn_ip_scale)
+        
+        # Handle token scale parameters
+        if ip_token_scale is None:
+            ip_token_scale = attn_ip_scale  # Backward-compatible default
 
         # Handle both pil_image and clip_image_embeds cases
         if pil_image is not None:
@@ -360,9 +467,9 @@ class IPAdapterXL(IPAdapter):
         if negative_prompt is None:
             negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
-        if not isinstance(prompt, List):
+        if not isinstance(prompt, (list, tuple)):
             prompt = [prompt] * num_prompts
-        if not isinstance(negative_prompt, List):
+        if not isinstance(negative_prompt, (list, tuple)):
             negative_prompt = [negative_prompt] * num_prompts
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, clip_image_embeds=clip_image_embeds)
@@ -374,8 +481,8 @@ class IPAdapterXL(IPAdapter):
 
         with torch.inference_mode():
             (
-                prompt_embeds,
-                negative_prompt_embeds,
+                prompt_embeds_text,
+                negative_prompt_embeds_text,
                 pooled_prompt_embeds,
                 negative_pooled_prompt_embeds,
             ) = self.pipe.encode_prompt(
@@ -384,8 +491,26 @@ class IPAdapterXL(IPAdapter):
                 do_classifier_free_guidance=True,
                 negative_prompt=negative_prompt,
             )
-            prompt_embeds = torch.cat([prompt_embeds, image_prompt_embeds], dim=1)
-            negative_prompt_embeds = torch.cat([negative_prompt_embeds, uncond_image_prompt_embeds], dim=1)
+            
+            # Use the new mixing helper with separate scales
+            result = self._mix_text_ip_tokens(
+                prompt_embeds_text=prompt_embeds_text,
+                negative_prompt_embeds_text=negative_prompt_embeds_text,
+                image_prompt_embeds=image_prompt_embeds,
+                uncond_image_prompt_embeds=uncond_image_prompt_embeds,
+                text_token_scale=text_token_scale,
+                ip_token_scale=ip_token_scale,
+                ip_uncond_scale=ip_uncond_scale,
+                zero_ip_in_uncond=zero_ip_in_uncond,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            )
+            
+            # Handle return values (SDXL returns 4 values, SD1.5 returns 2)
+            if len(result) == 4:
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = result
+            else:
+                prompt_embeds, negative_prompt_embeds = result
 
         self.generator = get_generator(seed, self.device)
         
@@ -394,6 +519,7 @@ class IPAdapterXL(IPAdapter):
             negative_prompt_embeds=negative_prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             generator=self.generator,
             **kwargs,
@@ -503,13 +629,23 @@ class IPAdapterPlusXL(IPAdapter):
         clip_image_embeds=None,
         prompt=None,
         negative_prompt=None,
-        scale=1.0,
+        attn_ip_scale=1.0,
+        text_token_scale=1.0,
+        ip_token_scale=None,
+        ip_uncond_scale=None,
+        zero_ip_in_uncond=False,
         num_samples=4,
         seed=None,
+        guidance_scale=7.5,
         num_inference_steps=30,
         **kwargs,
     ):
-        self.set_scale(scale)
+        # Set the per-layer IP attention gate
+        self.set_scale(attn_ip_scale)
+        
+        # Handle token scale parameters
+        if ip_token_scale is None:
+            ip_token_scale = attn_ip_scale  # Backward-compatible default
 
         # Handle both PIL images and pre-computed CLIP embeddings
         if pil_image is not None:
@@ -524,9 +660,9 @@ class IPAdapterPlusXL(IPAdapter):
         if negative_prompt is None:
             negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
-        if not isinstance(prompt, List):
+        if not isinstance(prompt, (list, tuple)):
             prompt = [prompt] * num_prompts
-        if not isinstance(negative_prompt, List):
+        if not isinstance(negative_prompt, (list, tuple)):
             negative_prompt = [negative_prompt] * num_prompts
 
         image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, clip_image_embeds)
@@ -538,8 +674,8 @@ class IPAdapterPlusXL(IPAdapter):
 
         with torch.inference_mode():
             (
-                prompt_embeds,
-                negative_prompt_embeds,
+                prompt_embeds_text,
+                negative_prompt_embeds_text,
                 pooled_prompt_embeds,
                 negative_pooled_prompt_embeds,
             ) = self.pipe.encode_prompt(
@@ -548,8 +684,26 @@ class IPAdapterPlusXL(IPAdapter):
                 do_classifier_free_guidance=True,
                 negative_prompt=negative_prompt,
             )
-            prompt_embeds = torch.cat([prompt_embeds, image_prompt_embeds], dim=1)
-            negative_prompt_embeds = torch.cat([negative_prompt_embeds, uncond_image_prompt_embeds], dim=1)
+            
+            # Use the new mixing helper with separate scales
+            result = self._mix_text_ip_tokens(
+                prompt_embeds_text=prompt_embeds_text,
+                negative_prompt_embeds_text=negative_prompt_embeds_text,
+                image_prompt_embeds=image_prompt_embeds,
+                uncond_image_prompt_embeds=uncond_image_prompt_embeds,
+                text_token_scale=text_token_scale,
+                ip_token_scale=ip_token_scale,
+                ip_uncond_scale=ip_uncond_scale,
+                zero_ip_in_uncond=zero_ip_in_uncond,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            )
+            
+            # Handle return values (SDXL returns 4 values, SD1.5 returns 2)
+            if len(result) == 4:
+                prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds = result
+            else:
+                prompt_embeds, negative_prompt_embeds = result
 
         generator = get_generator(seed, self.device)
 
@@ -558,6 +712,7 @@ class IPAdapterPlusXL(IPAdapter):
             negative_prompt_embeds=negative_prompt_embeds,
             pooled_prompt_embeds=pooled_prompt_embeds,
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+            guidance_scale=guidance_scale,
             num_inference_steps=num_inference_steps,
             generator=generator,
             **kwargs,
